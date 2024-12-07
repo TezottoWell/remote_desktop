@@ -47,19 +47,17 @@ class ServerThread(QThread):
             
             while self.running:
                 try:
-
                     with mss.mss() as sct:
                         monitor = sct.monitors[0]
                         screenshot = np.array(sct.grab(monitor))
-                        
 
                     _, buffer = cv2.imencode('.jpg', screenshot, [cv2.IMWRITE_JPEG_QUALITY, 50])
                     compressed_img = zlib.compress(buffer)
                     
-                    self.client_socket.sendall(len(compressed_img).to_bytes(4, byteorder='big'))
-                    self.client_socket.sendall(compressed_img)
+                    if self.client_socket:
+                        self.client_socket.sendall(len(compressed_img).to_bytes(4, byteorder='big'))
+                        self.client_socket.sendall(compressed_img)
                     
-                    # Processar comandos recebidos
                     self.process_commands()
                     
                 except Exception as e:
@@ -70,13 +68,17 @@ class ServerThread(QThread):
             print(f"Erro no servidor: {e}")
         
         finally:
-            if self.server_socket:
-                self.server_socket.close()
+            self.cleanup()
     
     def process_commands(self):
-
+        if not self.client_socket:
+            return
+            
         try:
             command = self.client_socket.recv(1024).decode('utf-8')
+            if not command:
+                return
+                
             if command.startswith('MOUSE_MOVE'):
                 _, x, y = command.split(',')
                 pyautogui.moveTo(int(x), int(y))
@@ -86,13 +88,27 @@ class ServerThread(QThread):
             elif command.startswith('KEY_PRESS'):
                 _, key = command.split(',')
                 pyautogui.press(key)
-        except:
-            pass
+        except socket.error:
+            self.running = False
+    
+    def cleanup(self):
+        if self.client_socket:
+            try:
+                self.client_socket.close()
+            except:
+                pass
+            self.client_socket = None
+            
+        if self.server_socket:
+            try:
+                self.server_socket.close()
+            except:
+                pass
+            self.server_socket = None
     
     def stop(self):
         self.running = False
-        if self.server_socket:
-            self.server_socket.close()
+        self.cleanup()
 
 class ClientThread(QThread):
     image_update = pyqtSignal(QImage)
@@ -108,17 +124,16 @@ class ClientThread(QThread):
         try:
             self.client_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
             self.client_socket.connect((self.host, self.port))
+            print(f"Conectado ao servidor {self.host}:{self.port}")
             self.running = True
             
             while self.running:
-
                 img_size_bytes = self.client_socket.recv(4)
                 if not img_size_bytes:
                     break
                 
                 img_size = int.from_bytes(img_size_bytes, byteorder='big')
                 
-
                 compressed_img = b''
                 while len(compressed_img) < img_size:
                     chunk = self.client_socket.recv(min(img_size - len(compressed_img), 4096))
@@ -126,12 +141,10 @@ class ClientThread(QThread):
                         break
                     compressed_img += chunk
                 
-
                 decompressed_img = zlib.decompress(compressed_img)
                 nparr = np.frombuffer(decompressed_img, np.uint8)
                 frame = cv2.imdecode(nparr, cv2.IMREAD_COLOR)
                 
-                # Converter para formato QImage
                 rgb_image = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
                 h, w, ch = rgb_image.shape
                 bytes_per_line = ch * w
@@ -143,20 +156,36 @@ class ClientThread(QThread):
             print(f"Erro no cliente: {e}")
         
         finally:
-            if self.client_socket:
+            self.cleanup()
+    
+    def cleanup(self):
+        if self.client_socket:
+            try:
                 self.client_socket.close()
+            except:
+                pass
+            self.client_socket = None
     
     def send_mouse_move(self, x, y):
-        if self.client_socket:
-            self.client_socket.send(f'MOUSE_MOVE,{x},{y}'.encode('utf-8'))
+        if self.client_socket and self.running:
+            try:
+                self.client_socket.send(f'MOUSE_MOVE,{x},{y}'.encode('utf-8'))
+            except socket.error:
+                self.running = False
     
     def send_mouse_click(self, button='left'):
-        if self.client_socket:
-            self.client_socket.send(f'MOUSE_CLICK,{button}'.encode('utf-8'))
+        if self.client_socket and self.running:
+            try:
+                self.client_socket.send(f'MOUSE_CLICK,{button}'.encode('utf-8'))
+            except socket.error:
+                self.running = False
     
     def send_key_press(self, key):
-        if self.client_socket:
-            self.client_socket.send(f'KEY_PRESS,{key}'.encode('utf-8'))
+        if self.client_socket and self.running:
+            try:
+                self.client_socket.send(f'KEY_PRESS,{key}'.encode('utf-8'))
+            except socket.error:
+                self.running = False
 
 class FullScreenRemoteView(QMainWindow):
     close_signal = pyqtSignal()
@@ -171,17 +200,14 @@ class FullScreenRemoteView(QMainWindow):
         self.setup_event_handlers()
 
     def initUI(self):
-
         self.setWindowTitle('Tela Remota')
         self.setWindowFlags(Qt.WindowStaysOnTopHint | Qt.FramelessWindowHint)
         self.showFullScreen()
 
-        # Layout principal
         central_widget = QWidget()
         self.setCentralWidget(central_widget)
         layout = QVBoxLayout()
 
-        # Label para exibir tela remota
         self.screen_label = QLabel('Tela Remota')
         self.screen_label.setAlignment(Qt.AlignCenter)
         layout.addWidget(self.screen_label)
@@ -189,12 +215,9 @@ class FullScreenRemoteView(QMainWindow):
         central_widget.setLayout(layout)
 
     def setup_event_handlers(self):
-        # Eventos de mouse
         self.screen_label.mouseMoveEvent = self.mouseMoveEvent
         self.screen_label.mousePressEvent = self.mousePressEvent
         self.screen_label.mouseReleaseEvent = self.mouseReleaseEvent
-
-        # Evento de teclado
         self.keyPressEvent = self.handle_key_press
 
     def update_screen(self, image):
@@ -205,30 +228,27 @@ class FullScreenRemoteView(QMainWindow):
         self.screen_label.setPixmap(scaled_pixmap)
 
     def mouseMoveEvent(self, event):
-
         label_width = self.screen_label.width()
         label_height = self.screen_label.height()
         
-        x = int((event.x() / label_width) * 1920)  
+        x = int((event.x() / label_width) * 1920)
         y = int((event.y() / label_height) * 1080)
         
         self.mouse_move_signal.emit(x, y)
 
     def mousePressEvent(self, event):
-        button = 'left' if event.button() == 1 else 'right'
+        button = 'left' if event.button() == Qt.LeftButton else 'right'
         self.mouse_click_signal.emit(button)
 
     def mouseReleaseEvent(self, event):
-        pass  # TODO: lógica de soltar botão
+        pass
 
     def handle_key_press(self, event):
-
         key = event.text()
         if key:
             self.key_press_signal.emit(key)
 
     def keyReleaseEvent(self, event):
-        # Permite sair da tela cheia com ESC
         if event.key() == Qt.Key_Escape:
             self.close()
             self.close_signal.emit()
@@ -239,14 +259,12 @@ class RemoteAccessApp(QMainWindow):
         self.initUI()
         self.setupStyleSheet()
         
-        # Inicializar threads
         self.server_thread = None
         self.client_thread = None
         
         self.start_server()
     
     def setupStyleSheet(self):
-
         self.setStyleSheet("""
             QMainWindow {
                 background-color: #2C3E50;
@@ -300,7 +318,6 @@ class RemoteAccessApp(QMainWindow):
         
         main_layout = QVBoxLayout()
         
-        # Área de conexão com estilo de card
         connection_frame = QFrame()
         connection_frame.setStyleSheet("""
             QFrame {
@@ -311,12 +328,10 @@ class RemoteAccessApp(QMainWindow):
         """)
         connection_layout = QHBoxLayout()
         
-
         connection_title = QLabel('Configurações de Conexão')
         connection_title.setFont(QFont('Arial', 16, QFont.Bold))
         main_layout.addWidget(connection_title)
         
-
         host_label = QLabel('Endereço IP:')
         port_label = QLabel('Porta:')
         
@@ -327,7 +342,6 @@ class RemoteAccessApp(QMainWindow):
         self.port_input = QLineEdit('5000')
         self.port_input.setPlaceholderText('Porta de conexão')
         
-
         self.copy_ip_btn = QPushButton('Copiar IP')
         self.server_btn = QPushButton('Parar Servidor')
         self.client_btn = QPushButton('Conectar')
@@ -343,12 +357,10 @@ class RemoteAccessApp(QMainWindow):
         connection_frame.setLayout(connection_layout)
         main_layout.addWidget(connection_frame)
         
-
         self.status_label = QLabel('Status: Pronto para Conexão')
         self.status_label.setObjectName('statusLabel')
         main_layout.addWidget(self.status_label)
         
-
         self.screen_label = QLabel('Tela Remota')
         self.screen_label.setAlignment(Qt.AlignCenter)
         self.screen_label.setStyleSheet("""
@@ -363,25 +375,19 @@ class RemoteAccessApp(QMainWindow):
         
         central_widget.setLayout(main_layout)
         
-
         self.server_btn.clicked.connect(self.start_server)
         self.client_btn.clicked.connect(self.connect_client)
         self.copy_ip_btn.clicked.connect(self.copy_ip)
         
-
         self.center()
     
     def center(self):
-        # Centraliza a janela na tela
         frame_geometry = self.frameGeometry()
         screen_center = QDesktopWidget().availableGeometry().center()
         frame_geometry.moveCenter(screen_center)
         self.move(frame_geometry.topLeft())
     
     def copy_ip(self):
-        """
-        Copia o IP para área de transferência
-        """
         ip = self.host_input.text()
         pyperclip.copy(ip)
         QMessageBox.information(self, 'IP Copiado', f'IP {ip} copiado para área de transferência')
@@ -391,14 +397,12 @@ class RemoteAccessApp(QMainWindow):
         port = int(self.port_input.text() or 5000)
         
         try:
-
             if self.server_thread and self.server_thread.isRunning():
                 self.server_thread.stop()
             
             self.server_thread = ServerThread(host, port)
             self.server_thread.start()
             
-            # Altera o texto e o estilo do botão
             self.server_btn.setText('Parar Servidor')
             self.server_btn.setStyleSheet("""
                 QPushButton {
@@ -420,7 +424,6 @@ class RemoteAccessApp(QMainWindow):
                 }
             """)
             
-
             self.server_btn.clicked.disconnect()
             self.server_btn.clicked.connect(self.stop_server)
             
@@ -433,7 +436,6 @@ class RemoteAccessApp(QMainWindow):
         if self.server_thread and self.server_thread.isRunning():
             self.server_thread.stop()
             
-
             self.server_btn.setText('Iniciar Servidor')
             self.server_btn.setStyleSheet("""
                 QPushButton {
@@ -455,7 +457,6 @@ class RemoteAccessApp(QMainWindow):
                 }
             """)
             
-
             self.server_btn.clicked.disconnect()
             self.server_btn.clicked.connect(self.start_server)
             
@@ -463,33 +464,31 @@ class RemoteAccessApp(QMainWindow):
             QMessageBox.information(self, 'Servidor', 'Servidor parado com sucesso')
     
     def connect_client(self):
-        host = self.host_input.text()
-        port = int(self.port_input.text() or 5000)
-        
         try:
-            self.client_thread = ClientThread(host, port)
+            host = self.host_input.text()
+            port = int(self.port_input.text() or 5000)
             
-
+            print(f"Tentando conectar a {host}:{port}")
+            self.client_thread = ClientThread(host, port)
+            print("Thread do cliente criada")
+            
             self.fullscreen_view = FullScreenRemoteView(self.client_thread)
             
-
             self.client_thread.image_update.connect(self.fullscreen_view.update_screen)
             
-
             self.fullscreen_view.mouse_move_signal.connect(self.client_thread.send_mouse_move)
             self.fullscreen_view.mouse_click_signal.connect(self.client_thread.send_mouse_click)
             self.fullscreen_view.key_press_signal.connect(self.client_thread.send_key_press)
             self.fullscreen_view.close_signal.connect(self.on_fullscreen_closed)
             
-
             self.client_thread.start()
             self.fullscreen_view.show()
             
-
             self.hide()
             
             self.status_label.setText(f'Status: Conectado a {host}:{port}')
         except Exception as e:
+            print(f"Erro detalhado na conexão: {str(e)}")
             QMessageBox.critical(self, 'Erro', f'Falha ao conectar: {e}')
     
     def on_fullscreen_closed(self):
@@ -497,6 +496,13 @@ class RemoteAccessApp(QMainWindow):
         if self.client_thread:
             self.client_thread.running = False
             self.client_thread.quit()
+    
+    def closeEvent(self, event):
+        if self.server_thread:
+            self.server_thread.stop()
+        if self.client_thread:
+            self.client_thread.running = False
+        event.accept()
 
 def main():
     app = QApplication(sys.argv)
@@ -506,3 +512,4 @@ def main():
 
 if __name__ == '__main__':
     main()
+
